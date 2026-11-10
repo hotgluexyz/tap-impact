@@ -119,6 +119,7 @@ class ImpactClient(object):
                           max_tries=7,
                           factor=3)
     def check_access(self):
+        """Verify account access, retrying transient server errors."""
         if self.__account_sid is None or self.__auth_token is None:
             raise Exception('Error: Missing account_sid or auth_token in config.json.')
         if self.__account_sid is None:
@@ -141,6 +142,8 @@ class ImpactClient(object):
             auth=(self.__account_sid, self.__auth_token))
         if response.status_code != 200:
             LOGGER.error('Error status_code = {}'.format(response.status_code))
+            if response.status_code >= 500:
+                raise Server5xxError()
             raise_for_error(response)
         else:
             return True

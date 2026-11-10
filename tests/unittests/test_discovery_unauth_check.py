@@ -1,7 +1,10 @@
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from tap_impact.client import ImpactForbiddenError
+import requests
+
+from tap_impact.client import ImpactClient, ImpactForbiddenError, ImpactUnauthorizedError
 from tap_impact.discover import (
     _apply_access_checks,
     _check_stream_access,
@@ -174,7 +177,6 @@ class TestApplyAccessChecks(unittest.TestCase):
         _apply_access_checks(client, schemas, field_metadata)
         self.assertIn('ads', schemas)
 
-
 class TestDiscover(unittest.TestCase):
     """Integration-style tests for the discover() function."""
 
@@ -290,6 +292,55 @@ class TestDiscover(unittest.TestCase):
         call_args = mock_access_checks.call_args[0]
         self.assertEqual(call_args[0], client)
 
+
+class TestDiscoveryAccessResponses(unittest.TestCase):
+    """Exercise discovery through the client with Impact's actual error format."""
+
+    def _response(self, status_code):
+        response = requests.Response()
+        response.status_code = status_code
+        response._content = json.dumps({
+            'status': status_code,
+            'title': 'Access Denied' if status_code == 403 else 'Response',
+        }).encode()
+        return response
+
+    @patch('tap_impact.client.requests.Session')
+    def test_forbidden_parents_and_children_are_excluded(self, session):
+        session.return_value.get.return_value = self._response(200)
+
+        def request(**kwargs):
+            denied = kwargs['url'].endswith(('/Catalogs.json', '/Campaigns.json'))
+            return self._response(403 if denied else 200)
+
+        session.return_value.request.side_effect = request
+        with ImpactClient('ACCT', 'TOKEN', 'Advertisers') as client:
+            catalog = discover(client, {})
+
+        streams = {entry.tap_stream_id for entry in catalog.streams}
+        self.assertIn('ads', streams)
+        self.assertIn('company_information', streams)
+        self.assertNotIn('catalogs', streams)
+        self.assertNotIn('catalog_items', streams)
+        self.assertNotIn('campaigns', streams)
+        for child in STREAMS['campaigns']['children']:
+            self.assertNotIn(child, streams)
+
+    @patch('tap_impact.client.requests.Session')
+    def test_all_forbidden_still_fails(self, session):
+        session.return_value.get.return_value = self._response(200)
+        session.return_value.request.return_value = self._response(403)
+        with self.assertRaisesRegex(ImpactForbiddenError, 'any supported streams'):
+            with ImpactClient('ACCT', 'TOKEN', 'Advertisers') as client:
+                discover(client, {})
+
+    @patch('tap_impact.client.requests.Session')
+    def test_unauthorized_probe_still_fails(self, session):
+        session.return_value.get.return_value = self._response(200)
+        session.return_value.request.return_value = self._response(401)
+        with self.assertRaises(ImpactUnauthorizedError):
+            with ImpactClient('ACCT', 'TOKEN', 'Advertisers') as client:
+                discover(client, {})
 
 if __name__ == '__main__':
     unittest.main()
