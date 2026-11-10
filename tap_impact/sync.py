@@ -46,7 +46,15 @@ def get_bookmark(state, stream, default):
     )
 
 
-def write_bookmark(state, stream, value):
+def write_bookmark(state, stream, value, pending_bookmarks=None):
+    """Save progress, or defer child progress until all parents are processed."""
+    if pending_bookmarks is not None:
+        previous = pending_bookmarks.get(stream)
+        current_value = transform_datetime(value) if isinstance(value, str) else value
+        previous_value = transform_datetime(previous) if isinstance(previous, str) else previous
+        if previous_value is None or current_value > previous_value:
+            pending_bookmarks[stream] = value
+        return
     if 'bookmarks' not in state:
         state['bookmarks'] = {}
     state['bookmarks'][stream] = value
@@ -149,13 +157,16 @@ def sync_endpoint(client,
                   id_fields=None,
                   selected_streams=None,
                   parent=None,
-                  parent_id=None):
+                  parent_id=None,
+                  pending_bookmarks=None):
 
 
     # Get the latest bookmark for the stream and set the last_integer/datetime
     last_datetime = None
     last_integer = None
     max_bookmark_value = None
+    child_bookmarks = {}
+    forbidden_children = set()
 
     end_dttm = utils.now()
     end_dt = end_dttm.date()
@@ -348,8 +359,10 @@ def sync_endpoint(client,
                                         id_fields=child_endpoint_config.get('key_properties'),
                                         selected_streams=selected_streams,
                                         parent=child_endpoint_config.get('parent'),
-                                        parent_id=parent_id)
+                                        parent_id=parent_id,
+                                        pending_bookmarks=child_bookmarks)
                                 except ImpactForbiddenError as err:
+                                    forbidden_children.add(child_stream_name)
                                     LOGGER.warning(
                                         "Skipping unauthorized child stream '%s' for parent "
                                         "stream '%s', parent_id '%s': %s",
@@ -362,7 +375,7 @@ def sync_endpoint(client,
 
             # Update the state with the max_bookmark_value for the stream
             if bookmark_field:
-                write_bookmark(state, stream_name, max_bookmark_value)
+                write_bookmark(state, stream_name, max_bookmark_value, pending_bookmarks)
 
             # Adjust total_records w/ record_count, if needed
             if record_count > total_records:
@@ -385,6 +398,9 @@ def sync_endpoint(client,
             offset = offset + limit
             page = page + 1
         endpoint_total = endpoint_total + total_records
+    for child_name, value in child_bookmarks.items():
+        if child_name not in forbidden_children:
+            write_bookmark(state, child_name, value, pending_bookmarks)
     # Return total_records (for all pages)
     return endpoint_total
 
