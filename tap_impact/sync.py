@@ -3,6 +3,7 @@ import json
 import singer
 from singer import metrics, metadata, Transformer, utils
 from singer.utils import strptime_to_utc
+from tap_impact.client import ImpactForbiddenError
 from tap_impact.transform import transform_json
 from tap_impact.streams import STREAMS
 
@@ -330,23 +331,31 @@ def sync_endpoint(client,
                                         '<model_id>', model_id)
                                 child_bookmark_field = next(iter(child_endpoint_config.get(
                                     'replication_keys', [])), None)
-                                child_total_records = sync_endpoint(
-                                    client=client,
-                                    catalog=catalog,
-                                    state=state,
-                                    config=config,
-                                    start_date=start_date,
-                                    stream_name=child_stream_name,
-                                    path=child_path,
-                                    endpoint_config=child_endpoint_config,
-                                    static_params=child_endpoint_config.get('params', {}),
-                                    bookmark_field=child_bookmark_field,
-                                    bookmark_type=child_endpoint_config.get('bookmark_type'),
-                                    data_key=child_endpoint_config.get('data_key', 'results'),
-                                    id_fields=child_endpoint_config.get('key_properties'),
-                                    selected_streams=selected_streams,
-                                    parent=child_endpoint_config.get('parent'),
-                                    parent_id=parent_id)
+                                try:
+                                    child_total_records = sync_endpoint(
+                                        client=client,
+                                        catalog=catalog,
+                                        state=state,
+                                        config=config,
+                                        start_date=start_date,
+                                        stream_name=child_stream_name,
+                                        path=child_path,
+                                        endpoint_config=child_endpoint_config,
+                                        static_params=child_endpoint_config.get('params', {}),
+                                        bookmark_field=child_bookmark_field,
+                                        bookmark_type=child_endpoint_config.get('bookmark_type'),
+                                        data_key=child_endpoint_config.get('data_key', 'results'),
+                                        id_fields=child_endpoint_config.get('key_properties'),
+                                        selected_streams=selected_streams,
+                                        parent=child_endpoint_config.get('parent'),
+                                        parent_id=parent_id)
+                                except ImpactForbiddenError as err:
+                                    LOGGER.warning(
+                                        "Skipping unauthorized child stream '%s' for parent "
+                                        "stream '%s', parent_id '%s': %s",
+                                        child_stream_name, stream_name, parent_id, err,
+                                    )
+                                    continue
                                 LOGGER.info(
                                     'FINISHED Sync for Stream: {}, parent_id: {}, total_records: {}'\
                                         .format(child_stream_name, parent_id, child_total_records))
