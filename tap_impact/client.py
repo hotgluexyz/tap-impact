@@ -79,23 +79,17 @@ def raise_for_error(response):
     try:
         response.raise_for_status()
     except (requests.HTTPError, requests.ConnectionError) as error:
+        ex = get_exception_for_error_code(response.status_code)
+        message = str(error)
         try:
-            content_length = len(response.content)
-            if content_length == 0:
-                # There is nothing we can do here since Impact has neither sent
-                # us a 2xx response nor a response content.
-                return
-            response = response.json()
-            if ('error' in response) or ('errorCode' in response):
-                message = '%s: %s' % (response.get('error', str(error)),
-                                      response.get('message', 'Unknown Error'))
-                error_code = response.get('status')
-                ex = get_exception_for_error_code(error_code)
-                raise ex(message)
-            else:
-                raise ImpactError(error)
+            body = response.json()
         except (ValueError, TypeError):
-            raise ImpactError(error)
+            body = {}
+        if isinstance(body, dict):
+            title = body.get('error') or body.get('title') or body.get('errorCode')
+            message = '%s: %s' % (title or message,
+                                  body.get('message') or body.get('detail') or 'Unknown Error')
+        raise ex(message) from error
 
 
 class ImpactClient(object):
