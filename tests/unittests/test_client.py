@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import requests
 from urllib.parse import urlparse
 
@@ -17,6 +17,7 @@ from tap_impact.client import (
     ImpactUnknownError,
     ImpactError,
     ImpactClient,
+    Server5xxError,
     ERROR_CODE_EXCEPTION_MAPPING,
 )
 
@@ -84,11 +85,41 @@ class TestRaiseForError(unittest.TestCase):
             )
         return resp
 
-    def test_empty_content_returns_none(self):
+    def test_empty_content_raises_mapped_exception(self):
         resp = self._make_response(500, content=b"")
-        # Should not raise — empty body is a no-op
-        result = raise_for_error(resp)
-        self.assertIsNone(result)
+        resp.json.side_effect = ValueError("No JSON")
+        with self.assertRaises(ImpactInternalServiceError):
+            raise_for_error(resp)
+
+    def test_impact_access_denied_body_raises_forbidden(self):
+        body = {"status": 403, "title": "Access Denied"}
+        resp = self._make_response(403, json_body=body)
+        with self.assertRaisesRegex(ImpactForbiddenError, "Access Denied"):
+            raise_for_error(resp)
+
+    def test_http_status_determines_exception_for_different_bodies(self):
+        bodies = [
+            {"error": "Forbidden", "message": "No access"},
+            {"error": "Forbidden", "status": "403"},
+            {"error": "Forbidden", "status": 401},
+            {}, [], None, "Forbidden",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                resp = self._make_response(403, json_body=body)
+                with self.assertRaises(ImpactForbiddenError):
+                    raise_for_error(resp)
+
+    def test_non_json_forbidden_raises_forbidden(self):
+        resp = self._make_response(403, content=b"Forbidden")
+        resp.json.side_effect = ValueError("No JSON")
+        with self.assertRaises(ImpactForbiddenError):
+            raise_for_error(resp)
+
+    def test_unauthorized_without_error_field_is_not_forbidden(self):
+        resp = self._make_response(401, json_body={"title": "Unauthorized"})
+        with self.assertRaises(ImpactUnauthorizedError):
+            raise_for_error(resp)
 
     def test_json_error_field_raises_mapped_exception(self):
         body = {"error": "Unauthorized", "message": "Invalid credentials", "status": 401}
@@ -141,3 +172,60 @@ class TestImpactClientInit(unittest.TestCase):
         client1 = ImpactClient("A", "T", "Advertisers")
         client2 = ImpactClient("A", "T", "Partners")
         self.assertNotEqual(client1.base_url, client2.base_url)
+
+
+class TestImpactClientAccess(unittest.TestCase):
+    def _make_response(self, status_code):
+        resp = requests.Response()
+        resp.status_code = status_code
+        resp._content = b'{"title":"Access Denied"}'
+        return resp
+
+    @patch('tap_impact.client.requests.Session')
+    def test_forbidden_credentials_fail_at_startup(self, session):
+        session.return_value.get.return_value = self._make_response(403)
+        with self.assertRaises(ImpactForbiddenError):
+            with ImpactClient('ACCT', 'TOKEN', 'Advertisers'):
+                pass
+        session.return_value.get.assert_called_once()
+        session.return_value.request.assert_not_called()
+
+    @patch('tap_impact.client.requests.Session')
+    def test_invalid_credentials_still_fail_at_startup(self, session):
+        session.return_value.get.return_value = self._make_response(401)
+        with self.assertRaises(ImpactUnauthorizedError):
+            with ImpactClient('ACCT', 'TOKEN', 'Advertisers'):
+                pass
+        session.return_value.get.assert_called_once()
+        session.return_value.request.assert_not_called()
+
+    @patch('backoff._sync.time.sleep')
+    @patch('tap_impact.client.requests.Session')
+    def test_startup_retries_server_errors_until_success(self, session, sleep):
+        for status in [500, 503, 520]:
+            with self.subTest(status=status):
+                session.return_value.get.reset_mock()
+                sleep.reset_mock()
+                session.return_value.get.side_effect = [
+                    self._make_response(status), self._make_response(200),
+                ]
+
+                with ImpactClient('ACCT', 'TOKEN', 'Advertisers'):
+                    pass
+
+                self.assertEqual(session.return_value.get.call_count, 2)
+                sleep.assert_called_once()
+
+    @patch('backoff._sync.time.sleep')
+    @patch('tap_impact.client.requests.Session')
+    def test_startup_stops_after_seven_server_errors(self, session, sleep):
+        response = self._make_response(503)
+        response._content = b''
+        session.return_value.get.return_value = response
+
+        with self.assertRaises(Server5xxError):
+            with ImpactClient('ACCT', 'TOKEN', 'Advertisers'):
+                pass
+
+        self.assertEqual(session.return_value.get.call_count, 7)
+        self.assertEqual(sleep.call_count, 6)

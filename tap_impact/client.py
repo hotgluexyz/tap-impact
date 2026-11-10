@@ -79,23 +79,17 @@ def raise_for_error(response):
     try:
         response.raise_for_status()
     except (requests.HTTPError, requests.ConnectionError) as error:
+        ex = get_exception_for_error_code(response.status_code)
+        message = str(error)
         try:
-            content_length = len(response.content)
-            if content_length == 0:
-                # There is nothing we can do here since Impact has neither sent
-                # us a 2xx response nor a response content.
-                return
-            response = response.json()
-            if ('error' in response) or ('errorCode' in response):
-                message = '%s: %s' % (response.get('error', str(error)),
-                                      response.get('message', 'Unknown Error'))
-                error_code = response.get('status')
-                ex = get_exception_for_error_code(error_code)
-                raise ex(message)
-            else:
-                raise ImpactError(error)
+            body = response.json()
         except (ValueError, TypeError):
-            raise ImpactError(error)
+            body = {}
+        if isinstance(body, dict):
+            title = body.get('error') or body.get('title') or body.get('errorCode')
+            message = '%s: %s' % (title or message,
+                                  body.get('message') or body.get('detail') or 'Unknown Error')
+        raise ex(message) from error
 
 
 class ImpactClient(object):
@@ -125,6 +119,7 @@ class ImpactClient(object):
                           max_tries=7,
                           factor=3)
     def check_access(self):
+        """Verify account access, retrying transient server errors."""
         if self.__account_sid is None or self.__auth_token is None:
             raise Exception('Error: Missing account_sid or auth_token in config.json.')
         if self.__account_sid is None:
@@ -147,6 +142,8 @@ class ImpactClient(object):
             auth=(self.__account_sid, self.__auth_token))
         if response.status_code != 200:
             LOGGER.error('Error status_code = {}'.format(response.status_code))
+            if response.status_code >= 500:
+                raise Server5xxError()
             raise_for_error(response)
         else:
             return True
